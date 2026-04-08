@@ -1,69 +1,258 @@
-// ─── Coverage Service Module ──────────────────────────────────────────
-// Parses Vitest/Istanbul coverage JSON output.
+import { spawn } from 'node:child_process';
+import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
+import * as path from 'node:path';
+import { CoverageCalculationResult, EngineError } from './types';
 
-import * as fs from 'fs';
-import * as path from 'path';
-import { CoverageResult, EngineError } from './types';
+const COVERAGE_TIMEOUT_MS = 60_000;
 
-/**
- * Structure of an Istanbul coverage entry for a single file.
- * Each key in statementMap is a statement ID.
- * The `s` object maps statement IDs to hit counts.
- */
-interface IstanbulFileCoverage {
-    s: Record<string, number>;
-    statementMap: Record<string, unknown>;
+interface ProcessOutput {
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
 }
 
-/**
- * Parse the coverage-final.json (Istanbul format) and compute
- * total statement coverage across all files.
- */
-export async function parseCoverage(projectDir: string): Promise<CoverageResult> {
-    // Vitest writes coverage to ./coverage by default
-    const coveragePath = path.join(projectDir, 'coverage', 'coverage-final.json');
+interface IstanbulFileCoverage {
+    l?: Record<string, number>;
+}
 
-    if (!fs.existsSync(coveragePath)) {
-        throw new EngineError(
-            'coverage',
-            `Coverage file not found at: ${coveragePath}. Ensure Vitest is configured to produce coverage output (--coverage flag).`
+type IstanbulCoverageReport = Record<string, IstanbulFileCoverage>;
+
+function resolveNpxCommand(): string {
+    return process.platform === 'win32' ? 'npx.cmd' : 'npx';
+}
+
+function stripAnsi(value: string): string {
+    return value.replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function detectPackageManager(projectDir: string): { command: string; args: string[] } {
+    if (fsSync.existsSync(path.join(projectDir, 'pnpm-lock.yaml'))) {
+        return { command: 'pnpm', args: ['install'] };
+    }
+
+    if (fsSync.existsSync(path.join(projectDir, 'yarn.lock'))) {
+        return { command: 'yarn', args: ['install'] };
+    }
+
+    return {
+        command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+        args: ['install'],
+    };
+}
+
+function isDependencyResolutionError(message: string): boolean {
+    const normalized = message.toLowerCase();
+    return normalized.includes('missing dependency')
+        || normalized.includes('cannot find module')
+        || normalized.includes('err_module_not_found')
+        || normalized.includes("is not recognized as an internal or external command")
+        || normalized.includes('module not found');
+}
+
+async function runInstall(projectDir: string): Promise<void> {
+    const installer = detectPackageManager(projectDir);
+    const output = await new Promise<ProcessOutput>((resolve, reject) => {
+        const processHandle = spawn(installer.command, installer.args, {
+            cwd: projectDir,
+            shell: true,
+            env: process.env,
+        });
+
+        let stdout = '';
+        let stderr = '';
+
+        processHandle.stdout.on('data', (chunk: Buffer) => {
+            stdout += chunk.toString();
+        });
+
+        processHandle.stderr.on('data', (chunk: Buffer) => {
+            stderr += chunk.toString();
+        });
+
+        processHandle.on('error', (error: Error) => {
+            reject(error);
+        });
+
+        processHandle.on('close', (exitCode: number | null) => {
+            resolve({ stdout, stderr, exitCode });
+        });
+    });
+
+    if (output.exitCode !== 0) {
+        const details = stripAnsi(output.stderr || output.stdout).trim();
+        throw new EngineError('coverage', `Dependency installation failed: ${details || 'Unknown installation error.'}`);
+    }
+}
+
+function resolveLocalRunnerPath(repoPath: string, framework: 'vitest' | 'jest'): string {
+    const executable = process.platform === 'win32' ? `${framework}.cmd` : framework;
+    return path.join(repoPath, 'node_modules', '.bin', executable);
+}
+
+function resolveRunnerCommand(repoPath: string, framework: 'vitest' | 'jest', args: string[]): { command: string; args: string[] } {
+    const localRunner = resolveLocalRunnerPath(repoPath, framework);
+    if (fsSync.existsSync(localRunner)) {
+        return {
+            command: localRunner,
+            args,
+        };
+    }
+
+    return {
+        command: resolveNpxCommand(),
+        args: [framework, ...args],
+    };
+}
+
+async function runVitestWithCoverage(repoPath: string): Promise<ProcessOutput> {
+    return new Promise<ProcessOutput>((resolve, reject) => {
+        const commandSpec = resolveRunnerCommand(repoPath, 'vitest', ['run', '--coverage', '--reporter=json']);
+        const processHandle = spawn(
+            commandSpec.command,
+            commandSpec.args,
+            {
+                cwd: repoPath,
+                shell: true,
+                env: process.env,
+            },
         );
-    }
 
-    const raw = fs.readFileSync(coveragePath, 'utf-8');
-    let coverageData: Record<string, IstanbulFileCoverage>;
+        let stdout = '';
+        let stderr = '';
 
-    try {
-        coverageData = JSON.parse(raw) as Record<string, IstanbulFileCoverage>;
-    } catch {
-        throw new EngineError('coverage', 'Failed to parse coverage JSON. File may be corrupted.');
-    }
+        processHandle.stdout.on('data', (chunk: Buffer) => {
+            stdout += chunk.toString();
+        });
 
-    let totalStatements = 0;
-    let coveredStatements = 0;
+        processHandle.stderr.on('data', (chunk: Buffer) => {
+            stderr += chunk.toString();
+        });
 
-    for (const filePath of Object.keys(coverageData)) {
-        const fileCov = coverageData[filePath];
+        const timeoutId = setTimeout(() => {
+            processHandle.kill('SIGTERM');
+            reject(new EngineError('coverage', 'Vitest coverage execution timed out after 60 seconds.'));
+        }, COVERAGE_TIMEOUT_MS);
 
-        if (!fileCov.s || !fileCov.statementMap) {
+        processHandle.on('error', (error: Error) => {
+            clearTimeout(timeoutId);
+            reject(new EngineError('coverage', `Failed to start Vitest: ${error.message}`));
+        });
+
+        processHandle.on('close', (exitCode: number | null) => {
+            clearTimeout(timeoutId);
+            resolve({ stdout, stderr, exitCode });
+        });
+    });
+}
+
+async function runJestWithCoverage(repoPath: string): Promise<ProcessOutput> {
+    return new Promise<ProcessOutput>((resolve, reject) => {
+        const commandSpec = resolveRunnerCommand(repoPath, 'jest', ['--json', '--coverage']);
+        const processHandle = spawn(
+            commandSpec.command,
+            commandSpec.args,
+            {
+                cwd: repoPath,
+                shell: true,
+                env: process.env,
+            },
+        );
+
+        let stdout = '';
+        let stderr = '';
+
+        processHandle.stdout.on('data', (chunk: Buffer) => {
+            stdout += chunk.toString();
+        });
+
+        processHandle.stderr.on('data', (chunk: Buffer) => {
+            stderr += chunk.toString();
+        });
+
+        const timeoutId = setTimeout(() => {
+            processHandle.kill('SIGTERM');
+            reject(new EngineError('coverage', 'Jest coverage execution timed out after 60 seconds.'));
+        }, COVERAGE_TIMEOUT_MS);
+
+        processHandle.on('error', (error: Error) => {
+            clearTimeout(timeoutId);
+            reject(new EngineError('coverage', `Failed to start Jest: ${error.message}`));
+        });
+
+        processHandle.on('close', (exitCode: number | null) => {
+            clearTimeout(timeoutId);
+            resolve({ stdout, stderr, exitCode });
+        });
+    });
+}
+
+function calculateCoverage(report: IstanbulCoverageReport): CoverageCalculationResult {
+    let totalLines = 0;
+    let coveredLines = 0;
+
+    for (const fileCoverage of Object.values(report)) {
+        const lineHits: Record<string, number> | undefined = fileCoverage.l;
+        if (!lineHits) {
             continue;
         }
 
-        for (const stmtId of Object.keys(fileCov.s)) {
-            totalStatements++;
-            if (fileCov.s[stmtId] > 0) {
-                coveredStatements++;
+        for (const hits of Object.values(lineHits)) {
+            totalLines += 1;
+            if (hits > 0) {
+                coveredLines += 1;
             }
         }
     }
 
-    const percentage = totalStatements > 0
-        ? Math.round((coveredStatements / totalStatements) * 10000) / 100
-        : 0;
+    const coveragePercent = totalLines === 0
+        ? 0
+        : Math.round((coveredLines / totalLines) * 10000) / 100;
 
     return {
-        totalLines: totalStatements,
-        coveredLines: coveredStatements,
-        percentage,
+        totalLines,
+        coveredLines,
+        coveragePercent,
     };
+}
+
+export async function calculateCodeCoverage(
+    repoPath: string,
+    framework: 'vitest' | 'jest' = 'vitest',
+): Promise<CoverageCalculationResult> {
+    let runResult: ProcessOutput = framework === 'jest'
+        ? await runJestWithCoverage(repoPath)
+        : await runVitestWithCoverage(repoPath);
+
+    if (runResult.exitCode !== 0) {
+        const cleanedError = stripAnsi(runResult.stderr || runResult.stdout).trim();
+        if (isDependencyResolutionError(cleanedError)) {
+            await runInstall(repoPath);
+            runResult = framework === 'jest'
+                ? await runJestWithCoverage(repoPath)
+                : await runVitestWithCoverage(repoPath);
+        }
+    }
+
+    if (runResult.exitCode !== 0) {
+        const errorText = stripAnsi(runResult.stderr || runResult.stdout).trim()
+            || `Coverage command failed with exit code ${runResult.exitCode}.`;
+        const label = framework === 'jest' ? 'Jest' : 'Vitest';
+        throw new EngineError('coverage', `${label} failed: ${errorText}`);
+    }
+
+    const coveragePath: string = path.join(repoPath, 'coverage', 'coverage-final.json');
+
+    const coverageJsonRaw: string = await fs.readFile(coveragePath, 'utf8').catch(() => {
+        throw new EngineError('coverage', `Coverage file does not exist: ${coveragePath}`);
+    });
+
+    let parsedReport: IstanbulCoverageReport;
+    try {
+        parsedReport = JSON.parse(coverageJsonRaw) as IstanbulCoverageReport;
+    } catch {
+        throw new EngineError('coverage', 'Coverage JSON is invalid and could not be parsed.');
+    }
+
+    return calculateCoverage(parsedReport);
 }

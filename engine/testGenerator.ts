@@ -1,19 +1,18 @@
-// ─── Test Generator Module ────────────────────────────────────────────
-// Generates Vitest unit tests for exported functions using a local LLaMA model.
+// testGenerator.ts - uses llama AI to generate tests
+// this is the coolest part of the project!!
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { ScannedFunction, ExistingTest, GeneratedTest, EngineError } from './types';
 
-const LLAMA_ENDPOINT = process.env.LLAMA_ENDPOINT ?? 'http://localhost:11434/api/generate';
-const LLAMA_MODEL = process.env.LLAMA_MODEL ?? 'llama3:latest';
-const GENERATED_DIR = '__generated_tests__';
+// where the llama api is running
+let LLAMA_URL = process.env.LLAMA_ENDPOINT ?? 'http://localhost:11434/api/generate';
+let LLAMA_MODEL = process.env.LLAMA_MODEL ?? 'llama3:latest';
+let GENERATED_FOLDER = '__generated_tests__';
 
-/**
- * Build a deterministic prompt for the LLM to generate a Vitest test.
- */
-function buildPrompt(fn: ScannedFunction, importPath: string): string {
-    return `You are a test engineer. Write a Vitest unit test for the following TypeScript/JavaScript function.
+// make the prompt for the AI
+function makePrompt(fn: ScannedFunction, importPath: string): string {
+    let prompt = `You are a test engineer. Write a Vitest unit test for the following TypeScript/JavaScript function.
 
 FUNCTION NAME: ${fn.functionName}
 FILE PATH: ${fn.filePath}
@@ -35,39 +34,49 @@ REQUIREMENTS:
 - Output ONLY the TypeScript test code
 - Do NOT include any markdown formatting, explanations, or comments outside the code
 - Do NOT wrap the code in markdown code fences`;
+    return prompt;
 }
 
-/**
- * Strip markdown code fences from LLM output if present.
- */
-function stripMarkdownFences(code: string): string {
+// remove the ``` stuff from the AI response
+function cleanUpCode(code: string): string {
     let cleaned = code.trim();
 
-    // Remove opening fence: ```typescript, ```ts, ```javascript, ```js, ```
-    cleaned = cleaned.replace(/^```(?:typescript|ts|javascript|js)?\s*\n?/i, '');
+    // remove the opening ```
+    if (cleaned.startsWith('```typescript') || cleaned.startsWith('```ts') || cleaned.startsWith('```javascript') || cleaned.startsWith('```js') || cleaned.startsWith('```')) {
+        let firstNewline = cleaned.indexOf('\n');
+        if (firstNewline !== -1) {
+            cleaned = cleaned.substring(firstNewline + 1);
+        } else {
+            cleaned = cleaned.replace(/^```\w*/, '');
+        }
+    }
 
-    // Remove closing fence
-    cleaned = cleaned.replace(/\n?```\s*$/i, '');
+    // remove the closing ```
+    if (cleaned.endsWith('```')) {
+        cleaned = cleaned.substring(0, cleaned.length - 3);
+    }
 
     return cleaned.trim();
 }
 
-/**
- * Call the local LLaMA model via Ollama API.
- */
+// call the llama AI api
 async function callLlama(prompt: string): Promise<string> {
-    const response = await fetch(LLAMA_ENDPOINT, {
+    console.log("calling llama api...");
+
+    let body = {
+        model: LLAMA_MODEL,
+        prompt: prompt,
+        stream: false,
+        options: {
+            temperature: 0.2,
+            num_predict: 2048,
+        },
+    };
+
+    let response = await fetch(LLAMA_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            model: LLAMA_MODEL,
-            prompt,
-            stream: false,
-            options: {
-                temperature: 0.2,
-                num_predict: 2048,
-            },
-        }),
+        body: JSON.stringify(body),
     });
 
     if (!response.ok) {
@@ -77,111 +86,126 @@ async function callLlama(prompt: string): Promise<string> {
         );
     }
 
-    const data = (await response.json()) as { response?: string };
+    let data: any = await response.json();
 
-    if (!data.response || data.response.trim().length === 0) {
+    if (!data.response || data.response.trim().length == 0) {
         throw new EngineError('test-generation', 'LLaMA returned empty response.');
     }
 
-    return stripMarkdownFences(data.response);
+    console.log("got response from llama!");
+    return cleanUpCode(data.response);
 }
 
-/**
- * Compute the relative import path from the generated test file to the source file.
- */
-function computeImportPath(projectDir: string, sourceFilePath: string): string {
-    const generatedDir = path.join(projectDir, GENERATED_DIR);
+// figure out the import path for the test file
+function getImportPath(projectDir: string, sourceFilePath: string): string {
+    let generatedDir = path.join(projectDir, GENERATED_FOLDER);
     let rel = path.relative(generatedDir, sourceFilePath);
-    // Normalize to forward slashes for import
-    rel = rel.replace(/\\/g, '/');
-    // Remove extension
+    // fix windows backslashes
+    rel = rel.split('\\').join('/');
+    // remove the file extension
     rel = rel.replace(/\.(ts|js|tsx|jsx)$/, '');
-    // Ensure relative prefix
+    // add ./ if needed
     if (!rel.startsWith('.')) {
         rel = './' + rel;
     }
     return rel;
 }
 
-/**
- * Determine a unique test file name that doesn't collide with existing tests.
- */
-function getUniqueTestFileName(
+// get a unique name for the test file so we dont overwrite anything
+function getTestFileName(
     functionName: string,
-    existingTestFiles: Set<string>,
+    existingTestFiles: string[],
     generatedDir: string
 ): string {
-    let candidate = `${functionName}.test.ts`;
+    let name = functionName + '.test.ts';
     let counter = 1;
 
-    while (
-        existingTestFiles.has(candidate) ||
-        fs.existsSync(path.join(generatedDir, candidate))
-    ) {
-        candidate = `${functionName}_${counter}.test.ts`;
-        counter++;
+    // keep trying until we find a name that doesnt exist
+    let nameExists = true;
+    while (nameExists) {
+        nameExists = false;
+        // check existing tests
+        for (let i = 0; i < existingTestFiles.length; i++) {
+            if (existingTestFiles[i] == name) {
+                nameExists = true;
+                break;
+            }
+        }
+        // check if file already exists on disk
+        if (fs.existsSync(path.join(generatedDir, name))) {
+            nameExists = true;
+        }
+        if (nameExists) {
+            name = functionName + '_' + counter + '.test.ts';
+            counter = counter + 1;
+        }
     }
 
-    return candidate;
+    return name;
 }
 
-/**
- * Generate a unit test for a single exported function.
- */
+// generate a test for one function
 export async function generateTestForFunction(
     fn: ScannedFunction,
     projectDir: string,
     existingTests: ExistingTest[]
 ): Promise<GeneratedTest> {
-    const generatedDir = path.join(projectDir, GENERATED_DIR);
+    let generatedDir = path.join(projectDir, GENERATED_FOLDER);
 
-    // Ensure generated tests directory exists
+    // make the folder if it doesnt exist
     if (!fs.existsSync(generatedDir)) {
         fs.mkdirSync(generatedDir, { recursive: true });
     }
 
-    // Build set of existing test file names for duplicate avoidance
-    const existingTestNames = new Set(existingTests.map((t) => t.fileName));
+    // get list of existing test file names
+    let existingNames: string[] = [];
+    for (let i = 0; i < existingTests.length; i++) {
+        existingNames.push(existingTests[i].fileName);
+    }
 
-    const importPath = computeImportPath(projectDir, fn.filePath);
-    const prompt = buildPrompt(fn, importPath);
+    let importPath = getImportPath(projectDir, fn.filePath);
+    let prompt = makePrompt(fn, importPath);
 
-    const testCode = await callLlama(prompt);
+    let testCode = await callLlama(prompt);
 
-    // Basic validation: must contain 'import' and 'describe' or 'it' or 'test'
-    if (!testCode.includes('import') || !(testCode.includes('describe') || testCode.includes('it(') || testCode.includes('test('))) {
+    // check if the code looks valid
+    let hasImport = testCode.includes('import');
+    let hasTest = testCode.includes('describe') || testCode.includes('it(') || testCode.includes('test(');
+    if (!hasImport || !hasTest) {
         throw new EngineError(
             'test-generation',
             `LLaMA returned invalid test code for function "${fn.functionName}". Output does not appear to be valid Vitest code.`
         );
     }
 
-    const testFileName = getUniqueTestFileName(fn.functionName, existingTestNames, generatedDir);
-    const testFilePath = path.join(generatedDir, testFileName);
+    let testFileName = getTestFileName(fn.functionName, existingNames, generatedDir);
+    let testFilePath = path.join(generatedDir, testFileName);
 
+    // write the test file
     fs.writeFileSync(testFilePath, testCode, 'utf-8');
+    console.log("wrote test file: " + testFilePath);
 
     return {
         functionName: fn.functionName,
-        testFilePath,
-        testCode,
+        testFilePath: testFilePath,
+        testCode: testCode,
     };
 }
 
-/**
- * Generate unit tests for all scanned functions.
- */
+// generate tests for ALL functions
 export async function generateAllTests(
     functions: ScannedFunction[],
     projectDir: string,
     existingTests: ExistingTest[]
 ): Promise<GeneratedTest[]> {
-    const results: GeneratedTest[] = [];
+    let results: GeneratedTest[] = [];
 
-    for (const fn of functions) {
-        const generated = await generateTestForFunction(fn, projectDir, existingTests);
+    for (let i = 0; i < functions.length; i++) {
+        console.log("generating test " + (i + 1) + " of " + functions.length);
+        let generated = await generateTestForFunction(functions[i], projectDir, existingTests);
         results.push(generated);
     }
 
+    console.log("done generating all tests!");
     return results;
 }

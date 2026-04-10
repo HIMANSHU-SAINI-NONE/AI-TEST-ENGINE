@@ -77,6 +77,18 @@ async function installProjectDependencies(projectDir: string): Promise<void> {
     }
 }
 
+async function installSpecificPackage(projectDir: string, packageName: string): Promise<void> {
+    const installer = detectPackageManager(projectDir);
+    const addArgs = installer.command === 'yarn'
+        ? ['add', '--dev', packageName]
+        : ['install', '--save-dev', packageName];
+    const output = await runCommand(installer.command, addArgs, projectDir);
+    if (output.exitCode !== 0) {
+        const details = stripAnsi(output.stderr || output.stdout).trim();
+        throw new EngineError('test-execution', `Failed to install ${packageName}: ${details || 'Unknown error.'}`);
+    }
+}
+
 function runCommand(command: string, args: string[], cwd: string): Promise<ProcessOutput> {
     return new Promise((resolve, reject) => {
         const child = spawn(command, args, {
@@ -246,8 +258,15 @@ export async function runTests(
         const errorText = stderrText || stdoutText || 'Test process failed without diagnostics.';
         const shouldRetry = attempt === 0 && isDependencyResolutionError(errorText);
         if (shouldRetry) {
-            logs.push('Detected dependency resolution error during test run; installing dependencies and retrying once.');
-            await installProjectDependencies(projectDir);
+            logs.push('Detected dependency resolution error during test run; attempting to resolve and retry once.');
+
+            if (errorText.toLowerCase().includes('@vitest/coverage-v8')) {
+                logs.push('Installing missing @vitest/coverage-v8 package...');
+                await installSpecificPackage(projectDir, '@vitest/coverage-v8');
+            } else {
+                await installProjectDependencies(projectDir);
+            }
+
             continue;
         }
 

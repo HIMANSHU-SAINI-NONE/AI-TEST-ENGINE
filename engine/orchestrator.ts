@@ -4,8 +4,10 @@ import { ensureTestingFramework } from './frameworkSetup';
 import { rateTestQuality } from './qualityRater';
 import { generateReport } from './reportGenerator';
 import { runTests } from './testRunner';
-import { EngineError, TestCaseResult } from './types';
+import { generateAllTests } from './testGenerator';
+import { CodebaseContext, EngineError, ExistingTest, ScannedFunction, TestCaseResult } from './types';
 import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 
 function stripAnsi(value: string): string {
     return value.replace(/\u001b\[[0-9;]*m/g, '');
@@ -40,6 +42,67 @@ interface PipelineResult {
     logs: string[];
 }
 
+async function extractScannedFunctions(context: CodebaseContext): Promise<ScannedFunction[]> {
+    const functions: ScannedFunction[] = [];
+
+    for (const file of context.files) {
+        if (file.isTestFile) continue;
+
+        const absolutePath = path.join(context.rootPath, file.relativePath);
+        let sourceText: string;
+        try {
+            sourceText = await fs.readFile(absolutePath, 'utf8');
+        } catch {
+            continue;
+        }
+
+        const lines = sourceText.split('\n');
+        const functionSymbols = file.symbols.filter((s) => s.kind === 'function');
+
+        for (const symbol of functionSymbols) {
+            const startIdx = symbol.line - 1;
+            if (startIdx < 0 || startIdx >= lines.length) continue;
+
+            let endIdx: number;
+
+            if (file.language === 'python') {
+                const baseIndent = (lines[startIdx].match(/^\s*/) ?? [''])[0].length;
+                endIdx = startIdx + 1;
+                while (endIdx < lines.length) {
+                    if (lines[endIdx].trim() !== '') {
+                        const indent = (lines[endIdx].match(/^\s*/) ?? [''])[0].length;
+                        if (indent <= baseIndent) break;
+                    }
+                    endIdx++;
+                }
+            } else {
+                let braceCount = 0;
+                let foundBrace = false;
+                endIdx = startIdx;
+                while (endIdx < lines.length && endIdx < startIdx + 200) {
+                    for (const ch of lines[endIdx]) {
+                        if (ch === '{') { braceCount++; foundBrace = true; }
+                        if (ch === '}') braceCount--;
+                    }
+                    endIdx++;
+                    if (foundBrace && braceCount <= 0) break;
+                }
+            }
+
+            const code = lines.slice(startIdx, endIdx).join('\n');
+            if (code.trim().length > 0) {
+                functions.push({
+                    functionName: symbol.name,
+                    functionCode: code,
+                    filePath: absolutePath,
+                });
+            }
+        }
+    }
+
+    return functions;
+}
+
 export async function runPipeline(projectDir: string): Promise<PipelineResult> {
     const logs: string[] = [];
 
@@ -54,11 +117,30 @@ export async function runPipeline(projectDir: string): Promise<PipelineResult> {
         const framework = await ensureTestingFramework(projectDir, context);
         logs.push(...framework.logs);
 
-        logs.push('Step 3: Running tests...');
+        if (context.testFiles.length === 0) {
+            logs.push('Step 3: No test files detected. Generating tests using AI...');
+            try {
+                const scannedFunctions = await extractScannedFunctions(context);
+                logs.push(`Found ${scannedFunctions.length} exported function(s) to generate tests for.`);
+
+                if (scannedFunctions.length > 0) {
+                    const existingTests: ExistingTest[] = [];
+                    const generatedTests = await generateAllTests(scannedFunctions, projectDir, existingTests);
+                    logs.push(`Successfully generated ${generatedTests.length} test file(s).`);
+                } else {
+                    logs.push('No testable functions found; skipping test generation.');
+                }
+            } catch (genError: unknown) {
+                const message = genError instanceof Error ? genError.message : String(genError);
+                logs.push(`Warning: Test generation failed (${stripAnsi(message)}). Proceeding without generated tests.`);
+            }
+        }
+
+        logs.push('Step 4: Running tests...');
         const testExecution = await runTests(projectDir, framework.framework);
         logs.push(...testExecution.logs);
 
-        logs.push('Step 4: Computing quality scores for each test...');
+        logs.push('Step 5: Computing quality scores for each test...');
         const enrichedResults: TestCaseResult[] = testExecution.testCases.map((testCase: TestCaseResult) => {
             const quality = rateTestQuality(testCase.testCode ?? '', testCase);
             return {
@@ -68,7 +150,7 @@ export async function runPipeline(projectDir: string): Promise<PipelineResult> {
             };
         });
 
-        logs.push('Step 5: Generating test report artifacts...');
+        logs.push('Step 6: Generating test report artifacts...');
         const reportPath = await generateReport(enrichedResults, projectDir);
         logs.push(`Report written to: ${reportPath}`);
 
@@ -102,7 +184,7 @@ export async function runPipeline(projectDir: string): Promise<PipelineResult> {
             ? qualityByTest.reduce((sum, item) => sum + item.qualityScore, 0) / qualityByTest.length
             : 0;
 
-        logs.push('Step 6: Calculating code coverage...');
+        logs.push('Step 7: Calculating code coverage...');
         const coverageFramework = framework.framework === 'jest' ? 'jest' : 'vitest';
         let coverage = {
             coveragePercent: 0,

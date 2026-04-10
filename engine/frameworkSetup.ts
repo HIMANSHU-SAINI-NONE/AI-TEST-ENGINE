@@ -133,7 +133,27 @@ export async function ensureTestingFramework(projectRoot: string, context: Codeb
     if (existingFramework && isSupportedRunner(existingFramework)) {
         logs.push('Detected existing testing framework in package.json; reusing current setup.');
 
-        const needsInstall = !pathExists(path.join(projectRoot, 'node_modules')) || !hasFrameworkBinary(projectRoot, existingFramework);
+        let packageModified = false;
+
+        // Ensure @vitest/coverage-v8 is present since the test runner always uses --coverage
+        if (existingFramework === 'vitest') {
+            const hasCoverageDep = Boolean(
+                parsed.devDependencies?.['@vitest/coverage-v8'] || parsed.dependencies?.['@vitest/coverage-v8'],
+            );
+
+            if (!hasCoverageDep) {
+                parsed.devDependencies = parsed.devDependencies ?? {};
+                parsed.devDependencies['@vitest/coverage-v8'] = parsed.devDependencies.vitest ?? '^3.2.4';
+                await fs.writeFile(packagePath, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8');
+                logs.push('Added missing @vitest/coverage-v8 to devDependencies for coverage support.');
+                packageModified = true;
+            }
+        }
+
+        const needsInstall = packageModified
+            || !pathExists(path.join(projectRoot, 'node_modules'))
+            || !hasFrameworkBinary(projectRoot, existingFramework);
+
         if (needsInstall) {
             await runCommand(installCommand.command, installCommand.args, projectRoot);
             logs.push(`Installed project dependencies using ${installCommand.command} to ensure ${existingFramework} is available.`);
